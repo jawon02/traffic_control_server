@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # 위에서 만든 라우터 파일 불러오기
-from routers import monitor, control
+from app.routers import monitor, control
 
 app = FastAPI(
     title="Traffic Control API",

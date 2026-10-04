@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from schemas.traffic import TrafficData, TrafficStatus
+from app.schemas.traffic import TrafficData, TrafficStatus
 
 router = APIRouter(prefix="/api/control", tags=["Control"])
 
