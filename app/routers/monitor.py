@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-router = APIRouter(prefix="/api", tags=["Monitoring"])
+router = APIRouter(prefix="/api/monitor", tags=["Monitoring"])
 
 @router.get("/intersections")
 def get_intersections():
@@ -8,10 +8,10 @@ def get_intersections():
     return [
         {
             "intersection_id": "intersection_01",
-            "intersection_name": "OO사거리"
+            "intersection_name": "조선대 사거리"
         },
         {
             "intersection_id": "intersection_02",
-            "intersection_name": "대학입구"
+            "intersection_name": "대학입구 삼거리"
         }
     ]
