@@ -11,6 +11,7 @@ class TrafficData(BaseModel):
     south_cars: int = 0
     east_cars: int = 0
     west_cars: int = 0
+    image_frame: Optional[str] = None # Base64 이미지 프레임 수신용
 
 # 서버가 제어 로직 처리 후 반환하는 응답 데이터 규격
 class TrafficResponse(BaseModel):
