@@ -7,7 +7,7 @@ from app.services.logic import evaluate_traffic_control
 
 router = APIRouter(prefix="/api/control", tags=["Control"])
 
-# 프론트엔드로 중계할 최신 전역 상태
+# 프론트엔드 및 SUMO로 중계할 최신 전역 상태
 latest_state = {
     "frame_bytes": None,
     "response": None,
@@ -23,14 +23,16 @@ def control_traffic(data: TrafficData):
         except Exception as e:
             print(f"[ERROR] Frame decode failed: {e}")
 
-    # 2. 신호 제어 알고리즘 수행
+    # 2. 신호 제어 알고리즘 수행 (east_cars, west_cars 추가)
     result = evaluate_traffic_control(
         pedestrian_count=data.pedestrian_count,
         exit_congested=data.exit_congested,
         accident_detected=data.accident_detected,
         emergency_detected=data.emergency_detected,
         north_cars=data.north_cars,
-        south_cars=data.south_cars
+        south_cars=data.south_cars,
+        east_cars=data.east_cars, # [추가]
+        west_cars=data.west_cars  # [추가]
     )
     
     # 3. 최신 분석 데이터 수신 기록 저장
@@ -39,7 +41,7 @@ def control_traffic(data: TrafficData):
     return result
 
 # ---------------------------------------------------------
-# 프론트엔드 전용 API 엔드포인트 2개
+# 프론트엔드 및 SUMO 연동 전용 API 엔드포인트
 # ---------------------------------------------------------
 
 # API 1: MJPEG 영상 스트리밍 주소 (DetailVideo.jsx 에서 사용)
@@ -59,7 +61,7 @@ async def video_stream():
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
-# API 2: 최신 데이터 폴링 주소 (DetailPanel.jsx 에서 사용)
+# API 2: 최신 전체 데이터 폴링 주소 (DetailPanel.jsx 및 SUMO 연동용)
 @router.get("/latest")
 def get_latest_traffic():
     if latest_state["response"] is None:
@@ -68,5 +70,16 @@ def get_latest_traffic():
     return {
         "status": "ACTIVE",
         "data": latest_state["data"],
+        "result": latest_state["response"]
+    }
+
+# API 3: SUMO 기존 bridge.py 호환 전용 신호 데이터 조회 주소
+@router.get("/signal")
+def get_signal_status():
+    if latest_state["response"] is None:
+        return {"status": "WAITING", "message": "신호 제어 데이터 대기 중"}
+    
+    return {
+        "status": "ACTIVE",
         "result": latest_state["response"]
     }
