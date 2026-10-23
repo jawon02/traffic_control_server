@@ -9,7 +9,7 @@ from app.routers import monitor, control # 라우터 모듈 임포트
 # 1. 로깅 설정 (서버 콘솔에 시간과 로그 레벨이 보기 좋게 찍히도록 설정)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("TrafficServer")
 
