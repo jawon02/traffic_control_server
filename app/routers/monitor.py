@@ -8,20 +8,20 @@ def get_intersections():
     return [
         {
             "intersection_id": 1,
-            "intersection_name": "조선대 사거리",
+            "intersection_name": "시연 도로",
             "cameras": [
-                {"camera_id": 1, "name": "북측 진입로 (CCTV 1)"},
-                {"camera_id": 2, "name": "남측 진입로 (CCTV 2)"},
-                {"camera_id": 3, "name": "동측 진입로 (CCTV 3)"},
-                {"camera_id": 4, "name": "서측 진입로 (준비 중)"}
+                {"camera_id": 1, "name": "(CCTV 1)"},
+                {"camera_id": 2, "name": "(CCTV 2)"},
+                {"camera_id": 3, "name": "(CCTV 3)"},
+                {"camera_id": 4, "name": "(준비 중)"}
             ]
         },
         {
             "intersection_id": 2,
-            "intersection_name": "대학입구 삼거리",
+            "intersection_name": "(준비 중)",
             "cameras": [
-                {"camera_id": 1, "name": "정문 진입로"},
-                {"camera_id": 2, "name": "후문 진입로"}
+                {"camera_id": 1, "name": "(준비 중)"},
+                {"camera_id": 2, "name": "(준비 중)"}
             ]
         }
     ]
