@@ -3,16 +3,16 @@ from typing import List, Optional, Dict, Any
 
 # 클라이언트(시뮬레이터)가 서버로 보내는 요청 데이터 규격
 class TrafficData(BaseModel):
-    # [추가] 교차로 및 카메라 식별자 (기본값 1)
     intersection_id: int = 1
     camera_id: int = 1
-    
-    # [추가] AI에서 집계한 전체 차량 수
     vehicle_count: int = 0
+    
+    # [프론트엔드 관제 요청 규격 필드]
+    roi_occupancy_ratio: float = 0.0          # 0.0 ~ 1.0 비율 (예: 0.42)
+    roi_congestion_threshold: float = 0.30     # 혼잡 판정 기준 비율 (기본값 0.30)
+    exit_congested: bool = False               # 혼잡 여부 (ratio >= threshold)
 
-    # 기존 요청 데이터 규격
     pedestrian_count: int = 0
-    exit_congested: bool = False
     accident_detected: bool = False
     emergency_detected: bool = False
     north_cars: int = 0
@@ -21,7 +21,7 @@ class TrafficData(BaseModel):
     west_cars: int = 0
     image_frame: Optional[str] = None # Base64 이미지 프레임 수신용
 
-# 서버가 제어 로직 처리 후 반환하는 응답 데이터 규격 (기존 유지)
+# 서버가 제어 로직 처리 후 반환하는 응답 데이터 규격
 class TrafficResponse(BaseModel):
     mode: str
     signal_action: str
