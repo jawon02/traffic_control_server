@@ -13,7 +13,7 @@ def get_intersections():
                 {"camera_id": 1, "name": "(CCTV 1)"},
                 {"camera_id": 2, "name": "(CCTV 2)"},
                 {"camera_id": 3, "name": "(CCTV 3)"},
-                {"camera_id": 4, "name": "(준비 중)"}
+                {"camera_id": 4, "name": "(CCTV 4)"}
             ]
         },
         {

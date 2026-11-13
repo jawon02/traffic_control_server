@@ -27,6 +27,6 @@ class TrafficResponse(BaseModel):
     signal_action: str
     active_events: List[str] = []
     message: str
-    green_times: Optional[Dict[str, int]] = None
+    green_times: Optional[Dict[str, int]] = None  # 예: {"east_green": 20, "north_green": 15, "south_green": 15, "west_green": 20}
     vehicle_count: Optional[Dict[str, int]] = None
     signal_state: Optional[Dict[str, str]] = None
