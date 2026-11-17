@@ -141,11 +141,28 @@ def get_signal_status(intersection_id: int = Query(1)):
         }
 
     raw_data = target_state.get("data", {})
+    
+    # 프론트엔드/SUMO 요구사항에 맞춘 16개 필드 구성
     vehicle_data = {
         "north_cars": raw_data.get("north_cars", 0),
+        "north_left_cars": raw_data.get("north_left_cars", 0),
+        "north_straight_cars": raw_data.get("north_straight_cars", 0),
+        "north_right_cars": raw_data.get("north_right_cars", 0),
+        
         "south_cars": raw_data.get("south_cars", 0),
+        "south_left_cars": raw_data.get("south_left_cars", 0),
+        "south_straight_cars": raw_data.get("south_straight_cars", 0),
+        "south_right_cars": raw_data.get("south_right_cars", 0),
+        
         "east_cars": raw_data.get("east_cars", 0),
-        "west_cars": raw_data.get("west_cars", 0)
+        "east_left_cars": raw_data.get("east_left_cars", 0),
+        "east_straight_cars": raw_data.get("east_straight_cars", 0),
+        "east_right_cars": raw_data.get("east_right_cars", 0),
+        
+        "west_cars": raw_data.get("west_cars", 0),
+        "west_left_cars": raw_data.get("west_left_cars", 0),
+        "west_straight_cars": raw_data.get("west_straight_cars", 0),
+        "west_right_cars": raw_data.get("west_right_cars", 0),
     }
 
     return {

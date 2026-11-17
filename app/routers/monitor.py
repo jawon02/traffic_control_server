@@ -8,7 +8,7 @@ def get_intersections():
     return [
         {
             "intersection_id": 1,
-            "intersection_name": "시연 도로",
+            "intersection_name": "관제 도로",
             "cameras": [
                 {"camera_id": 1, "name": "(CCTV 1)"},
                 {"camera_id": 2, "name": "(CCTV 2)"},

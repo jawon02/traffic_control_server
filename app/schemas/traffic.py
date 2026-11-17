@@ -15,10 +15,29 @@ class TrafficData(BaseModel):
     pedestrian_count: int = 0
     accident_detected: bool = False
     emergency_detected: bool = False
+
     north_cars: int = 0
     south_cars: int = 0
     east_cars: int = 0
     west_cars: int = 0
+
+    # [신규 추가] 방향별 세부 회전 차량 수 필드 (북/남/동/서 x 좌/직/우)
+    north_left_cars: int = 0
+    north_straight_cars: int = 0
+    north_right_cars: int = 0
+
+    south_left_cars: int = 0
+    south_straight_cars: int = 0
+    south_right_cars: int = 0
+
+    east_left_cars: int = 0
+    east_straight_cars: int = 0
+    east_right_cars: int = 0
+
+    west_left_cars: int = 0
+    west_straight_cars: int = 0
+    west_right_cars: int = 0
+
     image_frame: Optional[str] = None # Base64 이미지 프레임 수신용
 
 # 서버가 제어 로직 처리 후 반환하는 응답 데이터 규격
