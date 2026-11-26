@@ -9,7 +9,7 @@ EVENT_WEIGHTS = {
 }
 
 DEFAULT_EMERGENCY_VEHICLE_ID = "EMG-CAM3-001"
-DEFAULT_EMERGENCY_DIRECTION = "EAST"
+DEFAULT_EMERGENCY_DIRECTION = "WEST"
 
 
 def _make_green_times(
@@ -26,10 +26,19 @@ def _make_green_times(
     }
 
 
-def _build_signal_state(action: str) -> Dict[str, str]:
-    """신호 제어 액션에 따라 4방향(N/S/E/W) 개별 신호 상태를 동적으로 생성합니다."""
+def _build_signal_state(
+    action: str,
+    priority_direction: Optional[str] = None,
+) -> Dict[str, str]:
+    """신호 제어 액션 및 우선 방향에 따라 4방향(N/S/E/W) 신호 상태를 생성합니다."""
     if action == "EMERGENCY_CORRIDOR_GREEN":
-        return {"north": "RED", "south": "RED", "east": "GREEN", "west": "RED"}
+        target_dir = (priority_direction or DEFAULT_EMERGENCY_DIRECTION).lower()
+        return {
+            "north": "GREEN" if target_dir == "north" else "RED",
+            "south": "GREEN" if target_dir == "south" else "RED",
+            "east": "GREEN" if target_dir == "east" else "RED",
+            "west": "GREEN" if target_dir == "west" else "RED",
+        }
     elif action == "ACCIDENT_LANE_RED":
         return {"north": "RED", "south": "RED", "east": "YELLOW", "west": "YELLOW"}
     elif action == "ALL_RED_EXCEPT_BYPASS":
@@ -186,8 +195,7 @@ def evaluate_traffic_control(
                 "vehicle_id": vehicle_id,
             }
         ],
-        "message": "[긴급] 응급 차량 접근 감지! 해당 방향 골든타임 확보를 위해 통행로를 우선 개방합니다.",
-        # 응급 이벤트 중에도 기존 네 방향 green_times는 일반 주기 값으로 유지
+        "message": f"[긴급] 응급 차량 접근 감지! {direction} 방향 골든타임 확보를 위해 즉시 우선 신호를 부여합니다.",
         "green_times": _make_green_times(30, 30, 30, 30),
-        "signal_state": _build_signal_state(action),
+        "signal_state": _build_signal_state(action, priority_direction=direction),
     }

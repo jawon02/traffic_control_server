@@ -1,7 +1,8 @@
 import asyncio
 import base64
+from copy import deepcopy
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -21,12 +22,15 @@ router = APIRouter(prefix="/api/control", tags=["Control"])
 # 카메라별 최신 전역 상태 저장소 (Key: (intersection_id, camera_id))
 camera_states: Dict[Tuple[int, int], dict] = {}
 
-# 교차로별 응급 이벤트 상태 머신 저장소 (Key: intersection_id)
+# 교차로별 응급 이벤트 상태 머신 및 일시정지된 직전 신호 저장소 (Key: intersection_id)
 # event_state: "NONE" | "ACTIVE" | "CLEARED"
 emergency_states: Dict[int, dict] = {}
 
 # 돌발 사고 및 응급 차량 이벤트 이력 저장소 (최대 50개 유지)
 event_logs: List[dict] = []
+
+# 탐지 끊김(False)으로 중간에 풀리지 않게 유지하는 시간(초)
+ACTIVE_GRACE_SECONDS = 8.0
 
 # 응급 통과 완료(CLEARED) 상태를 유지할 시간(초)
 CLEARED_HOLD_SECONDS = 5.0
@@ -38,48 +42,107 @@ def _get_or_init_emergency_state(intersection_id: int) -> dict:
             "event_state": "NONE",
             "priority_direction": None,
             "emergency_vehicle_id": None,
+            "last_seen_active_ts": None,
             "cleared_at": None,
+            "paused_signal": None,
+            "consumed_ids": set(),  # 1회용 처리: 이미 완료된 응급차량 ID 기록
         }
     return emergency_states[intersection_id]
+
+
+def _snapshot_normal_or_congestion_signal(merged_data: dict) -> dict:
+    """응급 진입 시점 기준 일반/혼잡 신호 제어 상태를 스냅샷으로 고정합니다."""
+    base = evaluate_base_traffic(
+        pedestrian_count=0,
+        exit_congested=False,
+        accident_detected=False,
+        north_cars=merged_data.get("north_cars", 0),
+        south_cars=merged_data.get("south_cars", 0),
+        east_cars=merged_data.get("east_cars", 0),
+        west_cars=merged_data.get("west_cars", 0),
+    )
+    return {
+        "mode": base["mode"],
+        "signal_action": base["signal_action"],
+        "green_times": deepcopy(base["green_times"]),
+        "signal_state": deepcopy(base["signal_state"]),
+        "message": base["message"],
+    }
 
 
 def _update_emergency_state(
     intersection_id: int,
     emergency_detected: bool,
     now_ts: float,
+    paused_candidate: Optional[dict] = None,
     vehicle_id: Optional[str] = None,
     direction: Optional[str] = None,
 ) -> dict:
     state = _get_or_init_emergency_state(intersection_id)
-    resolved_id = vehicle_id or state.get("emergency_vehicle_id") or DEFAULT_EMERGENCY_VEHICLE_ID
+    consumed_ids: Set[str] = state["consumed_ids"]
+    candidate_id = vehicle_id or DEFAULT_EMERGENCY_VEHICLE_ID
     resolved_dir = (direction or state.get("priority_direction") or DEFAULT_EMERGENCY_DIRECTION).upper()
 
     if emergency_detected:
-        state["event_state"] = "ACTIVE"
-        state["priority_direction"] = resolved_dir
-        state["emergency_vehicle_id"] = resolved_id
-        state["cleared_at"] = None
-    else:
-        if state["event_state"] == "ACTIVE":
+        # 이미 1회 처리 완료된 응급차량 ID면 영상 루프로 True가 다시 와도 ACTIVE로 재진입하지 않음
+        if state["event_state"] != "ACTIVE" and candidate_id in consumed_ids:
+            pass
+        else:
+            if state["event_state"] != "ACTIVE":
+                state["paused_signal"] = (
+                    deepcopy(paused_candidate) if paused_candidate is not None else None
+                )
+            state["event_state"] = "ACTIVE"
+            state["priority_direction"] = resolved_dir
+            state["emergency_vehicle_id"] = candidate_id
+            state["last_seen_active_ts"] = now_ts
+            state["cleared_at"] = None
+            return state
+
+    # emergency_detected가 False이거나 이미 소비된 ID로 루프가 도는 경우
+    if state["event_state"] == "ACTIVE":
+        last_seen = state.get("last_seen_active_ts")
+        if last_seen is None or (now_ts - last_seen) >= ACTIVE_GRACE_SECONDS:
+            if state.get("emergency_vehicle_id"):
+                consumed_ids.add(state["emergency_vehicle_id"])
             state["event_state"] = "CLEARED"
             state["priority_direction"] = None
             state["emergency_vehicle_id"] = None
+            state["last_seen_active_ts"] = None
             state["cleared_at"] = now_ts
-        elif state["event_state"] == "CLEARED":
-            cleared_at = state.get("cleared_at")
-            if cleared_at is not None and (now_ts - cleared_at) > CLEARED_HOLD_SECONDS:
-                state["event_state"] = "NONE"
-                state["cleared_at"] = None
+    elif state["event_state"] == "CLEARED":
+        cleared_at = state.get("cleared_at")
+        if cleared_at is not None and (now_ts - cleared_at) > CLEARED_HOLD_SECONDS:
+            state["event_state"] = "NONE"
+            state["cleared_at"] = None
+            state["paused_signal"] = None
 
     return state
 
 
-def _aggregate_intersection_data(intersection_id: int) -> Tuple[dict, bool, bool]:
-    """교차로(intersection_id)에 속한 카메라 데이터를 병합합니다.
+def mark_emergency_cleared(intersection_id: int) -> dict:
+    """SUMO 브리지에서 응급차량이 교차로를 통과한 시점에 즉시 CLEARED로 전환하고 1회용 완료 처리합니다."""
+    now_ts = datetime.now().timestamp()
+    state = _get_or_init_emergency_state(intersection_id)
+    if state.get("emergency_vehicle_id"):
+        state["consumed_ids"].add(state["emergency_vehicle_id"])
+    else:
+        state["consumed_ids"].add(DEFAULT_EMERGENCY_VEHICLE_ID)
 
-    - 카메라 1번(혼잡)의 방향/회전 차량 수 및 혼잡/사고/보행자 지표를 기준으로 집계
-    - 카메라 3번(응급차량)의 emergency_detected 상태를 별도 반영
-    """
+    if state.get("paused_signal") is None:
+        merged_data, _, _ = _aggregate_intersection_data(intersection_id)
+        state["paused_signal"] = _snapshot_normal_or_congestion_signal(merged_data)
+
+    state["event_state"] = "CLEARED"
+    state["priority_direction"] = None
+    state["emergency_vehicle_id"] = None
+    state["last_seen_active_ts"] = None
+    state["cleared_at"] = now_ts
+    return state
+
+
+def _aggregate_intersection_data(intersection_id: int) -> Tuple[dict, bool, bool]:
+    """교차로(intersection_id)에 속한 카메라 데이터를 병합합니다."""
     merged_data = {
         "vehicle_count": 0,
         "pedestrian_count": 0,
@@ -163,14 +226,17 @@ def control_traffic(data: TrafficData):
     )
     camera_states[key]["data"] = dump_data
 
-    # 카메라 3번(또는 응급 감지 카메라) 기준 응급 상태 머신 갱신
-    if camera_id == 3 or data.emergency_detected:
+    merged_data, _, emergency_from_cam = _aggregate_intersection_data(intersection_id)
+    paused_snapshot = _snapshot_normal_or_congestion_signal(merged_data)
+
+    if camera_id == 3 or data.emergency_detected or emergency_from_cam:
         _update_emergency_state(
             intersection_id=intersection_id,
-            emergency_detected=bool(data.emergency_detected),
+            emergency_detected=bool(data.emergency_detected or emergency_from_cam),
             now_ts=now_ts,
-            vehicle_id=DEFAULT_EMERGENCY_VEHICLE_ID if data.emergency_detected else None,
-            direction=DEFAULT_EMERGENCY_DIRECTION if data.emergency_detected else None,
+            paused_candidate=paused_snapshot,
+            vehicle_id=DEFAULT_EMERGENCY_VEHICLE_ID if (data.emergency_detected or emergency_from_cam) else None,
+            direction=DEFAULT_EMERGENCY_DIRECTION if (data.emergency_detected or emergency_from_cam) else None,
         )
 
     emg_state = _get_or_init_emergency_state(intersection_id)
@@ -190,12 +256,17 @@ def control_traffic(data: TrafficData):
     )
 
     if emg_state["event_state"] == "CLEARED":
+        paused = emg_state.get("paused_signal") or paused_snapshot
+        result["mode"] = paused["mode"]
+        result["signal_action"] = paused["signal_action"]
+        result["green_times"] = deepcopy(paused["green_times"])
+        result["signal_state"] = deepcopy(paused["signal_state"])
         result["event_state"] = "CLEARED"
         result["priority_direction"] = None
         result["emergency_vehicle_id"] = None
         result["active_events"] = []
 
-    if data.accident_detected or data.emergency_detected:
+    if data.accident_detected or is_emg_active:
         event_type = "ACCIDENT" if data.accident_detected else "EMERGENCY"
         log_entry = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -216,11 +287,42 @@ def control_traffic(data: TrafficData):
     return result
 
 
+@router.post("/emergency/clear")
+def clear_emergency_event(intersection_id: int = Query(1)):
+    """SUMO 브리지에서 응급차량이 교차로를 통과한 시점에 호출하는 해제 엔드포인트."""
+    state = mark_emergency_cleared(intersection_id)
+    paused = state.get("paused_signal") or {}
+    return {
+        "status": "OK",
+        "intersection_id": intersection_id,
+        "event_state": state["event_state"],
+        "restored_mode": paused.get("mode"),
+        "restored_green_times": paused.get("green_times"),
+    }
+
+
+@router.post("/emergency/reset")
+def reset_emergency_history(intersection_id: int = Query(1)):
+    """재테스트를 원할 때 완료된 응급 ID 기록을 초기화합니다."""
+    state = _get_or_init_emergency_state(intersection_id)
+    state["consumed_ids"].clear()
+    state["event_state"] = "NONE"
+    state["priority_direction"] = None
+    state["emergency_vehicle_id"] = None
+    state["last_seen_active_ts"] = None
+    state["cleared_at"] = None
+    state["paused_signal"] = None
+    return {
+        "status": "OK",
+        "intersection_id": intersection_id,
+        "message": "응급 이벤트 이력 및 상태가 초기화되었습니다.",
+    }
+
+
 # ---------------------------------------------------------
 # 프론트엔드, 관제 및 SUMO 연동 전용 API 엔드포인트
 # ---------------------------------------------------------
 
-# API 1: MJPEG 영상 스트리밍 주소 (카메라별)
 @router.get("/stream")
 async def video_stream(intersection_id: int = Query(1), camera_id: int = Query(1)):
     key = (intersection_id, camera_id)
@@ -241,7 +343,6 @@ async def video_stream(intersection_id: int = Query(1), camera_id: int = Query(1
     )
 
 
-# API 2: 최신 전체 데이터 폴링 주소 (카메라별)
 @router.get("/latest")
 def get_latest_traffic(intersection_id: int = Query(1), camera_id: int = Query(1)):
     key = (intersection_id, camera_id)
@@ -262,20 +363,30 @@ def get_latest_traffic(intersection_id: int = Query(1), camera_id: int = Query(1
     }
 
 
-# API 3: SUMO 제어 전용 신호 데이터 조회 주소
 @router.get("/signal")
 def get_signal_status(intersection_id: int = Query(1)):
     now_ts = datetime.now().timestamp()
     merged_data, has_any_data, emergency_from_cam = _aggregate_intersection_data(intersection_id)
+    paused_snapshot = _snapshot_normal_or_congestion_signal(merged_data)
+    base_result = evaluate_base_traffic(
+        pedestrian_count=merged_data.get("pedestrian_count", 0),
+        exit_congested=bool(merged_data.get("exit_congested", False)),
+        accident_detected=bool(merged_data.get("accident_detected", False)),
+        north_cars=merged_data.get("north_cars", 0),
+        south_cars=merged_data.get("south_cars", 0),
+        east_cars=merged_data.get("east_cars", 0),
+        west_cars=merged_data.get("west_cars", 0),
+    )
+
     emg_state = _update_emergency_state(
         intersection_id=intersection_id,
         emergency_detected=emergency_from_cam,
         now_ts=now_ts,
+        paused_candidate=paused_snapshot,
     )
 
     event_state = emg_state["event_state"]
 
-    # 응급 이벤트가 ACTIVE 또는 CLEARED 상태일 때는 WAITING으로 떨어지지 않고 상태 유지
     if not has_any_data and event_state == "NONE":
         return {
             "status": "WAITING",
@@ -295,16 +406,6 @@ def get_signal_status(intersection_id: int = Query(1)):
             },
         }
 
-    base_result = evaluate_base_traffic(
-        pedestrian_count=merged_data.get("pedestrian_count", 0),
-        exit_congested=bool(merged_data.get("exit_congested", False)),
-        accident_detected=bool(merged_data.get("accident_detected", False)),
-        north_cars=merged_data.get("north_cars", 0),
-        south_cars=merged_data.get("south_cars", 0),
-        east_cars=merged_data.get("east_cars", 0),
-        west_cars=merged_data.get("west_cars", 0),
-    )
-
     if event_state == "ACTIVE":
         vehicle_id = emg_state.get("emergency_vehicle_id") or DEFAULT_EMERGENCY_VEHICLE_ID
         direction = (emg_state.get("priority_direction") or DEFAULT_EMERGENCY_DIRECTION).upper()
@@ -322,9 +423,9 @@ def get_signal_status(intersection_id: int = Query(1)):
             "priority_direction": direction,
             "emergency_vehicle_id": vehicle_id,
             "active_events": active_events_payload,
-            "message": "[긴급] 응급 차량 접근 감지! 동쪽 방향 우선 신호를 연동합니다.",
+            "message": f"[긴급] 응급 차량 접근 감지! {direction} 방향 골든타임 확보를 위해 즉시 우선 신호를 부여합니다.",
             "green_times": _make_green_times(30, 30, 30, 30),
-            "signal_state": _build_signal_state("EMERGENCY_CORRIDOR_GREEN"),
+            "signal_state": _build_signal_state("EMERGENCY_CORRIDOR_GREEN", priority_direction=direction),
         }
         return {
             "status": "ACTIVE",
@@ -334,11 +435,18 @@ def get_signal_status(intersection_id: int = Query(1)):
         }
 
     if event_state == "CLEARED":
-        cleared_result = dict(base_result)
-        cleared_result["event_state"] = "CLEARED"
-        cleared_result["priority_direction"] = None
-        cleared_result["emergency_vehicle_id"] = None
-        cleared_result["active_events"] = []
+        paused = emg_state.get("paused_signal") or paused_snapshot
+        cleared_result = {
+            "mode": paused["mode"],
+            "signal_action": paused["signal_action"],
+            "event_state": "CLEARED",
+            "priority_direction": None,
+            "emergency_vehicle_id": None,
+            "active_events": [],
+            "message": f"응급 차량 통과 완료. 일시정지되었던 {paused['mode']} 신호 제어를 재개합니다.",
+            "green_times": deepcopy(paused["green_times"]),
+            "signal_state": deepcopy(paused["signal_state"]),
+        }
         return {
             "status": "ACTIVE",
             "intersection_id": intersection_id,
@@ -354,7 +462,6 @@ def get_signal_status(intersection_id: int = Query(1)):
     }
 
 
-# API 4: 사고 및 응급차량 돌발 이벤트 이력 조회 API
 @router.get("/events")
 def get_event_logs():
     return {
@@ -363,13 +470,13 @@ def get_event_logs():
     }
 
 
-# API 5: 교차로 실시간 통합 상황 집계 API
 @router.get("/summary")
 def get_intersection_summary(intersection_id: int = Query(1)):
     total_vehicles = 0
     has_accident = False
-    has_emergency = False
     active_cams = []
+    emg_state = _get_or_init_emergency_state(intersection_id)
+    has_emergency = emg_state.get("event_state") == "ACTIVE"
 
     for (inter_id, cam_id), state in camera_states.items():
         if inter_id == intersection_id and state.get("data") is not None:
@@ -377,8 +484,6 @@ def get_intersection_summary(intersection_id: int = Query(1)):
             total_vehicles += cam_data.get("vehicle_count", 0)
             if cam_data.get("accident_detected"):
                 has_accident = True
-            if cam_data.get("emergency_detected"):
-                has_emergency = True
             active_cams.append(cam_id)
 
     status_str = "NORMAL"
