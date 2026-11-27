@@ -29,11 +29,108 @@ emergency_states: Dict[int, dict] = {}
 # 돌발 사고 및 응급 차량 이벤트 이력 저장소 (최대 50개 유지)
 event_logs: List[dict] = []
 
+# 벤치마크/비교 측정용 배치 저장소 (Key: batch_id)
+batches: Dict[str, dict] = {}
+_batch_seq: int = 0
+
 # 탐지 끊김(False)으로 중간에 풀리지 않게 유지하는 시간(초)
 ACTIVE_GRACE_SECONDS = 8.0
 
 # 응급 통과 완료(CLEARED) 상태를 유지할 시간(초)
 CLEARED_HOLD_SECONDS = 5.0
+
+
+def _generate_batch_id(intersection_id: int) -> str:
+    global _batch_seq
+    _batch_seq += 1
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"batch_i{intersection_id}_{ts}_{_batch_seq:04d}"
+
+
+def _extract_vehicle_counts(source: dict) -> dict:
+    keys = [
+        "vehicle_count",
+        "pedestrian_count",
+        "exit_congested",
+        "accident_detected",
+        "north_cars",
+        "north_left_cars",
+        "north_straight_cars",
+        "north_right_cars",
+        "south_cars",
+        "south_left_cars",
+        "south_straight_cars",
+        "south_right_cars",
+        "east_cars",
+        "east_left_cars",
+        "east_straight_cars",
+        "east_right_cars",
+        "west_cars",
+        "west_left_cars",
+        "west_straight_cars",
+        "west_right_cars",
+    ]
+    out = {}
+    for k in keys:
+        if k in source:
+            out[k] = source[k]
+        elif k in ("exit_congested", "accident_detected"):
+            out[k] = False
+        else:
+            out[k] = 0
+    return out
+
+
+def _format_batch_summary(batch_record: dict) -> dict:
+    counts = batch_record["counts"]
+    return {
+        "batch_id": batch_record["batch_id"],
+        "intersection_id": batch_record["intersection_id"],
+        "created_at": batch_record["created_at"],
+        "direction_totals": {
+            "north": counts.get("north_cars", 0),
+            "east": counts.get("east_cars", 0),
+            "south": counts.get("south_cars", 0),
+            "west": counts.get("west_cars", 0),
+        },
+        "movement_counts": {
+            "north": {
+                "left": counts.get("north_left_cars", 0),
+                "straight": counts.get("north_straight_cars", 0),
+                "right": counts.get("north_right_cars", 0),
+            },
+            "east": {
+                "left": counts.get("east_left_cars", 0),
+                "straight": counts.get("east_straight_cars", 0),
+                "right": counts.get("east_right_cars", 0),
+            },
+            "south": {
+                "left": counts.get("south_left_cars", 0),
+                "straight": counts.get("south_straight_cars", 0),
+                "right": counts.get("south_right_cars", 0),
+            },
+            "west": {
+                "left": counts.get("west_left_cars", 0),
+                "straight": counts.get("west_straight_cars", 0),
+                "right": counts.get("west_right_cars", 0),
+            },
+        },
+        "raw_counts": deepcopy(counts),
+    }
+
+
+def _normalize_four_way_green_times(green_times: Optional[dict], default_sec: int = 30) -> dict:
+    """east_green, west_green, north_green, south_green 키가 누락되지 않도록 보정합니다."""
+    src = green_times or {}
+    ns_fallback = src.get("north_south_green", default_sec)
+    ew_fallback = src.get("east_west_green", default_sec)
+
+    normalized = dict(src)
+    normalized["east_green"] = src.get("east_green", ew_fallback)
+    normalized["west_green"] = src.get("west_green", ew_fallback)
+    normalized["north_green"] = src.get("north_green", ns_fallback)
+    normalized["south_green"] = src.get("south_green", ns_fallback)
+    return normalized
 
 
 def _get_or_init_emergency_state(intersection_id: int) -> dict:
@@ -45,7 +142,7 @@ def _get_or_init_emergency_state(intersection_id: int) -> dict:
             "last_seen_active_ts": None,
             "cleared_at": None,
             "paused_signal": None,
-            "consumed_ids": set(),  # 1회용 처리: 이미 완료된 응급차량 ID 기록
+            "consumed_ids": set(),
         }
     return emergency_states[intersection_id]
 
@@ -64,7 +161,7 @@ def _snapshot_normal_or_congestion_signal(merged_data: dict) -> dict:
     return {
         "mode": base["mode"],
         "signal_action": base["signal_action"],
-        "green_times": deepcopy(base["green_times"]),
+        "green_times": _normalize_four_way_green_times(base["green_times"]),
         "signal_state": deepcopy(base["signal_state"]),
         "message": base["message"],
     }
@@ -84,7 +181,6 @@ def _update_emergency_state(
     resolved_dir = (direction or state.get("priority_direction") or DEFAULT_EMERGENCY_DIRECTION).upper()
 
     if emergency_detected:
-        # 이미 1회 처리 완료된 응급차량 ID면 영상 루프로 True가 다시 와도 ACTIVE로 재진입하지 않음
         if state["event_state"] != "ACTIVE" and candidate_id in consumed_ids:
             pass
         else:
@@ -99,7 +195,6 @@ def _update_emergency_state(
             state["cleared_at"] = None
             return state
 
-    # emergency_detected가 False이거나 이미 소비된 ID로 루프가 도는 경우
     if state["event_state"] == "ACTIVE":
         last_seen = state.get("last_seen_active_ts")
         if last_seen is None or (now_ts - last_seen) >= ACTIVE_GRACE_SECONDS:
@@ -143,29 +238,7 @@ def mark_emergency_cleared(intersection_id: int) -> dict:
 
 def _aggregate_intersection_data(intersection_id: int) -> Tuple[dict, bool, bool]:
     """교차로(intersection_id)에 속한 카메라 데이터를 병합합니다."""
-    merged_data = {
-        "vehicle_count": 0,
-        "pedestrian_count": 0,
-        "exit_congested": False,
-        "accident_detected": False,
-        "north_cars": 0,
-        "north_left_cars": 0,
-        "north_straight_cars": 0,
-        "north_right_cars": 0,
-        "south_cars": 0,
-        "south_left_cars": 0,
-        "south_straight_cars": 0,
-        "south_right_cars": 0,
-        "east_cars": 0,
-        "east_left_cars": 0,
-        "east_straight_cars": 0,
-        "east_right_cars": 0,
-        "west_cars": 0,
-        "west_left_cars": 0,
-        "west_straight_cars": 0,
-        "west_right_cars": 0,
-    }
-
+    merged_data = _extract_vehicle_counts({})
     has_any_data = False
     emergency_active_from_cam = False
 
@@ -199,8 +272,61 @@ def _aggregate_intersection_data(intersection_id: int) -> Tuple[dict, bool, bool
     return merged_data, has_any_data, emergency_active_from_cam
 
 
-@router.post("/", response_model=TrafficResponse)
-def control_traffic(data: TrafficData):
+def _build_profile_result(
+    counts: dict,
+    profile: str,
+    batch_id: Optional[str] = None,
+    emergency_detected: bool = False,
+    emergency_vehicle_id: Optional[str] = None,
+    priority_direction: Optional[str] = None,
+) -> dict:
+    normalized_profile = (profile or "adaptive").lower()
+
+    if normalized_profile == "baseline":
+        green_times = _normalize_four_way_green_times(
+            _make_green_times(30, 30, 30, 30),
+            default_sec=30,
+        )
+        res = {
+            "mode": "BASELINE_FIXED",
+            "signal_action": "FIXED_30S_CYCLE",
+            "event_state": "NONE",
+            "priority_direction": None,
+            "emergency_vehicle_id": None,
+            "active_events": [],
+            "green_times": green_times,
+            "signal_state": _build_signal_state("HOLD_CURRENT_SIGNAL"),
+            "message": "기준 신호(BASELINE) 적용: 동·서·남·북 각 30초 고정 신호 주기입니다.",
+            "profile": "baseline",
+        }
+        if batch_id is not None:
+            res["batch_id"] = batch_id
+        return res
+
+    res = evaluate_traffic_control(
+        pedestrian_count=counts.get("pedestrian_count", 0),
+        exit_congested=bool(counts.get("exit_congested", False)),
+        accident_detected=bool(counts.get("accident_detected", False)),
+        emergency_detected=emergency_detected,
+        north_cars=counts.get("north_cars", 0),
+        south_cars=counts.get("south_cars", 0),
+        east_cars=counts.get("east_cars", 0),
+        west_cars=counts.get("west_cars", 0),
+        emergency_vehicle_id=emergency_vehicle_id,
+        priority_direction=priority_direction,
+    )
+    res["green_times"] = _normalize_four_way_green_times(res.get("green_times"), default_sec=30)
+    res["profile"] = "adaptive"
+    if batch_id is not None:
+        res["batch_id"] = batch_id
+    return res
+
+
+@router.post("/")
+def control_traffic(
+    data: TrafficData,
+    batch_id: Optional[str] = Query(default=None),
+):
     intersection_id = getattr(data, "intersection_id", 1)
     camera_id = getattr(data, "camera_id", 1)
     key = (intersection_id, camera_id)
@@ -225,6 +351,49 @@ def control_traffic(data: TrafficData):
         else data.dict(exclude={"image_frame"})
     )
     camera_states[key]["data"] = dump_data
+
+    resolved_batch_id = batch_id or dump_data.get("batch_id") or _generate_batch_id(intersection_id)
+    batch_counts = _extract_vehicle_counts(dump_data)
+    if resolved_batch_id not in batches:
+        batches[resolved_batch_id] = {
+            "batch_id": resolved_batch_id,
+            "intersection_id": intersection_id,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "counts": batch_counts,
+        }
+    else:
+        existing_counts = batches[resolved_batch_id]["counts"]
+        if camera_id == 1:
+            for k in (
+                "north_cars",
+                "north_left_cars",
+                "north_straight_cars",
+                "north_right_cars",
+                "south_cars",
+                "south_left_cars",
+                "south_straight_cars",
+                "south_right_cars",
+                "east_cars",
+                "east_left_cars",
+                "east_straight_cars",
+                "east_right_cars",
+                "west_cars",
+                "west_left_cars",
+                "west_straight_cars",
+                "west_right_cars",
+                "vehicle_count",
+            ):
+                existing_counts[k] = batch_counts.get(k, 0)
+        existing_counts["pedestrian_count"] = max(
+            existing_counts.get("pedestrian_count", 0),
+            batch_counts.get("pedestrian_count", 0),
+        )
+        existing_counts["exit_congested"] = bool(
+            existing_counts.get("exit_congested", False) or batch_counts.get("exit_congested", False)
+        )
+        existing_counts["accident_detected"] = bool(
+            existing_counts.get("accident_detected", False) or batch_counts.get("accident_detected", False)
+        )
 
     merged_data, _, emergency_from_cam = _aggregate_intersection_data(intersection_id)
     paused_snapshot = _snapshot_normal_or_congestion_signal(merged_data)
@@ -254,12 +423,13 @@ def control_traffic(data: TrafficData):
         emergency_vehicle_id=emg_state.get("emergency_vehicle_id"),
         priority_direction=emg_state.get("priority_direction"),
     )
+    result["green_times"] = _normalize_four_way_green_times(result.get("green_times"), default_sec=30)
 
     if emg_state["event_state"] == "CLEARED":
         paused = emg_state.get("paused_signal") or paused_snapshot
         result["mode"] = paused["mode"]
         result["signal_action"] = paused["signal_action"]
-        result["green_times"] = deepcopy(paused["green_times"])
+        result["green_times"] = _normalize_four_way_green_times(paused["green_times"], default_sec=30)
         result["signal_state"] = deepcopy(paused["signal_state"])
         result["event_state"] = "CLEARED"
         result["priority_direction"] = None
@@ -283,8 +453,25 @@ def control_traffic(data: TrafficData):
             if len(event_logs) > 50:
                 event_logs.pop()
 
+    result["batch_id"] = resolved_batch_id
     camera_states[key]["response"] = result
     return result
+
+
+@router.get("/batch/{batch_id}")
+def get_batch_info(batch_id: str):
+    """특정 batch_id의 방향별 총 차량 수와 회전별 차량 수를 조회합니다."""
+    batch_record = batches.get(batch_id)
+    if not batch_record:
+        return {
+            "status": "WAITING",
+            "batch_id": batch_id,
+            "message": f"배치 {batch_id} 데이터를 찾을 수 없습니다.",
+        }
+    return {
+        "status": "ACTIVE",
+        **_format_batch_summary(batch_record),
+    }
 
 
 @router.post("/emergency/clear")
@@ -297,13 +484,16 @@ def clear_emergency_event(intersection_id: int = Query(1)):
         "intersection_id": intersection_id,
         "event_state": state["event_state"],
         "restored_mode": paused.get("mode"),
-        "restored_green_times": paused.get("green_times"),
+        "restored_green_times": _normalize_four_way_green_times(paused.get("green_times"), default_sec=30),
     }
 
 
 @router.post("/emergency/reset")
-def reset_emergency_history(intersection_id: int = Query(1)):
-    """재테스트를 원할 때 완료된 응급 ID 기록을 초기화합니다."""
+def reset_emergency_history(
+    intersection_id: int = Query(1),
+    clear_batches: bool = Query(False),
+):
+    """재테스트를 원할 때 완료된 응급 ID 기록과 상태를 초기화합니다."""
     state = _get_or_init_emergency_state(intersection_id)
     state["consumed_ids"].clear()
     state["event_state"] = "NONE"
@@ -312,9 +502,16 @@ def reset_emergency_history(intersection_id: int = Query(1)):
     state["last_seen_active_ts"] = None
     state["cleared_at"] = None
     state["paused_signal"] = None
+
+    if clear_batches:
+        to_del = [bid for bid, b in batches.items() if b.get("intersection_id") == intersection_id]
+        for bid in to_del:
+            del batches[bid]
+
     return {
         "status": "OK",
         "intersection_id": intersection_id,
+        "cleared_batches": clear_batches,
         "message": "응급 이벤트 이력 및 상태가 초기화되었습니다.",
     }
 
@@ -351,20 +548,70 @@ def get_latest_traffic(intersection_id: int = Query(1), camera_id: int = Query(1
     if not state or state.get("response") is None:
         return {
             "status": "WAITING",
+            "batch_id": None,
             "message": f"교차로 {intersection_id} - 카메라 {camera_id} AI 분석 데이터 대기 중",
         }
 
+    resp = state["response"]
     return {
         "status": "ACTIVE",
         "intersection_id": intersection_id,
         "camera_id": camera_id,
+        "batch_id": resp.get("batch_id"),
         "data": state["data"],
-        "result": state["response"],
+        "result": resp,
     }
 
 
 @router.get("/signal")
-def get_signal_status(intersection_id: int = Query(1)):
+def get_signal_status(
+    intersection_id: int = Query(1),
+    batch_id: Optional[str] = Query(default=None),
+    profile: Optional[str] = Query(default=None),
+):
+    if batch_id is not None:
+        batch_record = batches.get(batch_id)
+        if not batch_record:
+            default_gt = _normalize_four_way_green_times(_make_green_times(30, 30, 30, 30), default_sec=30)
+            return {
+                "status": "WAITING",
+                "intersection_id": intersection_id,
+                "batch_id": batch_id,
+                "profile": profile or "adaptive",
+                "message": f"배치 {batch_id} 데이터가 아직 준비되지 않았습니다.",
+                "data": None,
+                "result": {
+                    "mode": "WAITING",
+                    "signal_action": "WAIT",
+                    "event_state": "NONE",
+                    "priority_direction": None,
+                    "emergency_vehicle_id": None,
+                    "active_events": [],
+                    "batch_id": batch_id,
+                    "profile": profile or "adaptive",
+                    "message": f"배치 {batch_id} 데이터가 아직 준비되지 않았습니다.",
+                    "green_times": default_gt,
+                    "signal_state": _build_signal_state("HOLD_CURRENT_SIGNAL"),
+                },
+            }
+
+        counts = batch_record["counts"]
+        chosen_profile = profile or "adaptive"
+        control_result = _build_profile_result(
+            counts=counts,
+            profile=chosen_profile,
+            batch_id=batch_id,
+        )
+        return {
+            "status": "ACTIVE",
+            "intersection_id": intersection_id,
+            "batch_id": batch_id,
+            "profile": chosen_profile,
+            "data": counts,
+            "batch_summary": _format_batch_summary(batch_record),
+            "result": control_result,
+        }
+
     now_ts = datetime.now().timestamp()
     merged_data, has_any_data, emergency_from_cam = _aggregate_intersection_data(intersection_id)
     paused_snapshot = _snapshot_normal_or_congestion_signal(merged_data)
@@ -377,6 +624,7 @@ def get_signal_status(intersection_id: int = Query(1)):
         east_cars=merged_data.get("east_cars", 0),
         west_cars=merged_data.get("west_cars", 0),
     )
+    base_result["green_times"] = _normalize_four_way_green_times(base_result.get("green_times"), default_sec=30)
 
     emg_state = _update_emergency_state(
         intersection_id=intersection_id,
@@ -401,7 +649,7 @@ def get_signal_status(intersection_id: int = Query(1)):
                 "emergency_vehicle_id": None,
                 "active_events": [],
                 "message": f"교차로 {intersection_id}의 신호 제어 데이터 대기 중",
-                "green_times": _make_green_times(30, 30, 30, 30),
+                "green_times": _normalize_four_way_green_times(_make_green_times(30, 30, 30, 30), default_sec=30),
                 "signal_state": _build_signal_state("HOLD_CURRENT_SIGNAL"),
             },
         }
@@ -424,7 +672,7 @@ def get_signal_status(intersection_id: int = Query(1)):
             "emergency_vehicle_id": vehicle_id,
             "active_events": active_events_payload,
             "message": f"[긴급] 응급 차량 접근 감지! {direction} 방향 골든타임 확보를 위해 즉시 우선 신호를 부여합니다.",
-            "green_times": _make_green_times(30, 30, 30, 30),
+            "green_times": _normalize_four_way_green_times(_make_green_times(30, 30, 30, 30), default_sec=30),
             "signal_state": _build_signal_state("EMERGENCY_CORRIDOR_GREEN", priority_direction=direction),
         }
         return {
@@ -444,7 +692,7 @@ def get_signal_status(intersection_id: int = Query(1)):
             "emergency_vehicle_id": None,
             "active_events": [],
             "message": f"응급 차량 통과 완료. 일시정지되었던 {paused['mode']} 신호 제어를 재개합니다.",
-            "green_times": deepcopy(paused["green_times"]),
+            "green_times": _normalize_four_way_green_times(paused["green_times"], default_sec=30),
             "signal_state": deepcopy(paused["signal_state"]),
         }
         return {
@@ -452,6 +700,16 @@ def get_signal_status(intersection_id: int = Query(1)):
             "intersection_id": intersection_id,
             "data": merged_data,
             "result": cleared_result,
+        }
+
+    if profile and profile.lower() == "baseline":
+        baseline_res = _build_profile_result(merged_data, profile="baseline")
+        return {
+            "status": "ACTIVE",
+            "intersection_id": intersection_id,
+            "profile": "baseline",
+            "data": merged_data,
+            "result": baseline_res,
         }
 
     return {
